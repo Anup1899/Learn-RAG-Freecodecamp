@@ -187,3 +187,16 @@ A vector database stores embeddings and enables fast similarity search to find t
 | **1. Same embedding model** | Use the same model for both indexing and querying — ensures vectors are in the same space for accurate retrieval. |
 | **2. Quality over quantity** | Prioritize high-quality, relevant vectors over a large number of low-quality ones — reduces noise and improves results. |
 | **3. Test retrieval separately** | Validate retrieval performance independent of generation — isolates issues and makes debugging easier. |
+
+
+
+<!-- 
+# The 5 RAG Failure Modes
+1. Bad Chunking -- Wrong Cuts, WRORS, ILLOGICAL
+2. Embedding Mismatch -- Query Vector and Document Vector mismatch. When user queries use different words than the words found in the document, then the semantic seach fails 
+3. Retrival Noise -- Signal Noise and Irrelevant Results
+4. Context Overflow - Data Splitting Out, Overflow and Exceed Limits
+5. Hallucination - Imagination, False Information
+
+
+-->
