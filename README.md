@@ -319,37 +319,313 @@ Hybrid Score = α × BM25 Score + (1 - α) × Vector Score
 
 
 
-<!--
-# Hybrid Search Pipeline
-- [QueryBox] SKU-7742 specifications
-- [Vector Search Result] ---- Doc 3[Rank 1], Doc 7[Rank 2], Doc 1[Rank 5]
-- [BM25 Search Result] ---- Doc 1[Rank 1], Doc 3[Rank 2], Doc 5[Rank 53]
-- [Reciprocal Rank Fusion (RRF)** or a weighted score] -- Document that appears good in both rise on the top
-- [Final Result] --- Doc 1 (won appreas in both)
+---
+
+## How the Hybrid Search Pipeline Works (Step by Step)
+
+For a query like `"SKU-7742X specifications"`, here is what happens inside the pipeline:
+
+```
+User Query: "SKU-7742X specifications"
+        │
+        ├──► Vector Search (semantic)    → Doc3[Rank 1], Doc7[Rank 2], Doc1[Rank 5]
+        │
+        └──► BM25 Search (keyword)       → Doc1[Rank 1], Doc3[Rank 2], Doc5[Rank 53]
+                                                    │
+                                        Reciprocal Rank Fusion (RRF)
+                                                    │
+                                        Doc1 appears Rank 5 (vector) + Rank 1 (BM25)
+                                        Doc3 appears Rank 1 (vector) + Rank 2 (BM25)
+                                                    │
+                                           Final Ranked Results
+                                        1. Doc3  (top in both)
+                                        2. Doc1  (strong in BM25, present in vector)
+```
+
+**Why RRF works:** A document that ranks highly in both retrieval methods is almost certainly relevant — it matches both the semantic meaning and the exact keywords of the query. RRF rewards consistent cross-method presence rather than a single very high score in one method.
+
+**RRF formula:**
+```
+RRF_score(doc) = Σ  1 / (k + rank_in_retriever)
+                retrievers
+```
+`k = 60` is the standard constant — it dampens the advantage of very top ranks and prevents a single Rank 1 result from dominating. Documents ranked Rank 1 and Rank 5 score closer together than you'd expect, so results that appear *consistently* across retrievers beat results that dominate *one* retriever.
+
+---
+
+## How `EnsembleRetriever` Works
+
+`EnsembleRetriever` is LangChain's built-in implementation of the hybrid pipeline above. You pass it a list of retrievers and a weight list — it runs them in parallel, collects ranked results, applies weighted RRF, and returns a single merged list.
+
+```python
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[bm25_retriever, vector_retriever],
+    weights=[0.5, 0.5]   # equal weight to keyword and semantic
+)
+results = ensemble_retriever.invoke("SKU-7742X specifications")
+```
+
+The `weights` parameter scales each retriever's RRF contribution before summing:
+
+| Weight config | Effect |
+|---|---|
+| `[0.5, 0.5]` | Equal hybrid — good general default |
+| `[0.7, 0.3]` | BM25-heavy — use when queries are ID/code-heavy |
+| `[0.3, 0.7]` | Vector-heavy — use when queries are conversational |
+
+---
+
+## Production Considerations for Hybrid Search
+
+### 1. BM25 Rebuild Strategy
+
+BM25 is a **static index** — it is built once over a fixed corpus and has no concept of incremental updates. Adding new documents without rebuilding means those documents are invisible to BM25 retrieval.
+
+| Scenario | Recommended approach |
+|---|---|
+| Small corpus, infrequent updates | Rebuild the full BM25 index on every document addition |
+| Large corpus, frequent updates | Rebuild on a schedule (e.g. nightly) and accept a staleness window |
+| Real-time freshness required | Use a keyword search engine (Elasticsearch, OpenSearch) instead of BM25 — they support incremental indexing |
+
+```python
+# Full rebuild — call this whenever documents change
+bm25_retriever = BM25Retriever.from_documents(all_documents, k=4)
+```
+
+---
+
+### 2. Tuning `k` — Retrieve More, Let RRF Sort
+
+Set `k` (number of results each retriever returns) **higher than you actually need**. RRF needs enough candidates from each retriever to do meaningful re-ranking. If `k` is too low, a relevant document might not even enter the fusion pool.
+
+| k value | Effect |
+|---|---|
+| `k = 1–2` | Too narrow — RRF has almost nothing to re-rank |
+| `k = 3` | Minimum viable for most use cases |
+| `k = 4–6` | Recommended default — good recall without context overflow |
+| `k = 10+` | Use only if feeding into a re-ranker that compresses the list before the LLM |
+
+```python
+bm25_retriever = BM25Retriever.from_documents(documents, k=4)
+vector_retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+```
+
+After RRF, the merged list is de-duplicated and re-ranked — you won't necessarily send all `k × n_retrievers` chunks to the LLM, just the top results from the fused list.
+
+---
+
+### 3. Latency — Two Searches Instead of One
+
+Hybrid search adds approximately **20–25ms** of latency compared to a single vector search. The two retrievers run in parallel (LangChain's `EnsembleRetriever` does this by default), so the total latency is roughly `max(BM25_latency, vector_latency) + RRF_overhead`, not the sum.
+
+| Component | Typical latency |
+|---|---|
+| Vector search (Chroma/Pinecone) | 10–50ms |
+| BM25 (in-memory, small corpus) | 1–5ms |
+| RRF merge | < 1ms |
+| **Total hybrid overhead vs vector-only** | **~20–25ms** |
+
+This overhead is almost always worth it when retrieval accuracy matters. If latency is critical, cache BM25 results for frequent queries or pre-filter the corpus with metadata before running either retriever.
+
+---
+
+### 4. Context Overflow — Too Many Retrieved Chunks
+
+More retrieved chunks = more tokens sent to the LLM. Hybrid search can make this worse because you are merging results from two retrievers.
+
+**Calculate your token budget before setting `k`:**
+
+```
+available_tokens  = model_context_limit - system_prompt_tokens - response_reserve
+max_chunks        = available_tokens // avg_chunk_size_in_tokens
+
+# Example: 8192 limit, 500-token system prompt, 500-token response reserve, 300-token chunks
+max_chunks = (8192 - 500 - 500) // 300 = 23 chunks max
+```
+
+**Practical rules:**
+- Start with `k = 4` per retriever; the RRF-merged list will have ≤ 4 unique top results if there is strong overlap
+- Add a re-ranker (cross-encoder) after RRF to compress the list to the top 2–3 before sending to the LLM
+- Use `max_tokens_limit` in LangChain's `ContextualCompressionRetriever` to enforce a hard token cap on retrieved content
+
+---
+
+### 5. Token Budgeting
+
+Token budgeting is the practice of explicitly allocating the model's context window across all inputs before making an API call. Without it, retrieved chunks silently crowd out other important content.
+
+**Context window allocation:**
+
+```
+┌─────────────────────────────────────────────┐
+│  Model Context Window (e.g. 8,192 tokens)   │
+├─────────────────┬───────────────────────────┤
+│ System Prompt   │  ~500 tokens (fixed)       │
+├─────────────────┼───────────────────────────┤
+│ Chat History    │  ~1,000 tokens (variable)  │
+├─────────────────┼───────────────────────────┤
+│ Retrieved Chunks│  ~4,000 tokens (RAG budget)│
+├─────────────────┼───────────────────────────┤
+│ User Query      │  ~200 tokens               │
+├─────────────────┼───────────────────────────┤
+│ Response Reserve│  ~2,492 tokens             │
+└─────────────────┴───────────────────────────┘
+```
+
+**Key practices:**
+- Define the RAG budget explicitly and enforce it — do not let retrieval consume the full remaining window
+- Count tokens *before* the API call using the model's tokenizer (e.g. `tiktoken` for OpenAI, `anthropic.count_tokens()` for Claude)
+- If retrieved content exceeds the budget, truncate or compress the lowest-ranked chunks first — never truncate the top-ranked ones
+- For long conversations, summarize or evict old turns to protect the RAG budget
 
 
-# Hybrid Search adds the Latency of 20-25ms
 
-# Vector Retriver and BM25 Retriver are passed from the Ensemble Retriver, which combines both the result and provide the results on the top which are in found in both the retriver
+---
 
+## Why Debugging LLM Pipelines is Hard
 
-# Production consideration for Hybrid Search
-# BM25 REBUILD 
-- BM25 doesn't support incremental updates
-- Rebuild when adding documents
+Traditional software fails loudly — an exception is raised, a stack trace points to the line, and the fix is clear. LLM pipelines fail quietly in ways that are much harder to catch and reproduce.
 
-# k Value
-- Retrive more let RRF sort
-- k = 4 r higher recommended
+### 1. Non-Determinism — Same Input, Different Output
 
-# Latency
-- Hybrid add 20-25ms
-- Two seached instead of one
+LLMs are probabilistic. With `temperature > 0`, the same query can produce a different answer on every call. This means a bug you saw once might not reproduce on the next run, and a test that passes today might fail tomorrow with identical inputs.
 
-# Too much of context
+**Why it matters for debugging:**
+- You cannot rely on "run it again and see if it breaks"
+- A regression may only appear 1 in 10 runs — easy to miss in CI
+- Comparing outputs across runs requires semantic evaluation, not string equality
 
+**Mitigation:** Use `temperature=0` for deterministic testing. Log every input/output pair so you can replay the exact run that failed.
 
-# TOKEN BUDEGETING
+---
 
+### 2. Cascading Errors — One Bad Step Poisons Everything Downstream
 
--->
+In a multi-step pipeline, an error in an early stage silently propagates and corrupts every stage after it. No exception is raised — the pipeline just produces a wrong answer confidently.
+
+```
+Query: "What is our refund policy for SKU-7742X?"
+
+Step 1 — Retrieval:  Returns docs about general returns (wrong chunk retrieved)
+                              ↓
+Step 2 — Prompt:     "Based on the context, answer the question..."
+                              ↓
+Step 3 — LLM:        Generates a plausible-sounding but incorrect refund policy
+                              ↓
+Step 4 — Output:     "Your refund window is 30 days." ← confident wrong answer
+```
+
+The LLM had nothing wrong with it. The retriever failed silently, and the error cascaded through. Without tracing each step, you would only see the final wrong answer and have no idea where the pipeline broke.
+
+**Mitigation:** Test and evaluate each stage in isolation — retrieval quality separately from generation quality.
+
+---
+
+### 3. Silent Failure — No Crash, Just a Confident Wrong Answer
+
+Traditional bugs crash. LLM bugs smile and lie. The pipeline completes successfully with status 200, the user gets a response, and no alert fires — but the answer is wrong, outdated, or hallucinated.
+
+**Common silent failure patterns:**
+
+| Failure | What the user sees | What actually happened |
+|---|---|---|
+| Wrong chunk retrieved | A confident answer | Retriever returned an unrelated doc |
+| Hallucination | A specific, detailed answer | LLM invented a fact not in any chunk |
+| Prompt injection | An unexpected response | User input modified the prompt behavior |
+| Truncated context | A partial or vague answer | Context window overflowed silently |
+
+**Mitigation:** Add faithfulness checks — after generating, verify each claim is grounded in the retrieved chunks. Alert on low-confidence or out-of-scope responses rather than returning them silently.
+
+---
+
+### 4. Cost Surprise — 10 LLM Calls Instead of 2
+
+LLM API costs scale with token usage and the number of calls. A pipeline that seems simple can silently make far more calls than expected — due to retries, agent loops, sub-chains, or unbounded context windows.
+
+**Example: an agent loop that should run twice runs ten times**
+```
+Expected:  Query → Retrieve → Generate  (2 LLM calls, ~2,000 tokens, ~$0.002)
+Actual:    Query → Retrieve → Generate → Retry → Retrieve → Generate → ...
+           (10 LLM calls, ~20,000 tokens, ~$0.02 per query × 10,000 users = $200/day)
+```
+
+The pipeline works correctly — it just costs 5× more than budgeted, and no error is logged.
+
+**Mitigation:** Set explicit `max_iterations` on agents. Log token usage per run. Set cost alerts in your LLM provider dashboard. Track cost per query over time, not just total monthly spend.
+
+---
+
+## Observability with LangSmith
+
+LangSmith is LangChain's tracing and evaluation platform. It solves all four debugging problems above by making every step of the pipeline visible.
+
+### What LangSmith Captures Per Run
+
+| Signal | What you see |
+|---|---|
+| **Inputs / Outputs** | Exact prompt sent and response received at every step |
+| **Latency** | Time taken by each node (retriever, LLM, parser) |
+| **Token usage** | Prompt tokens, completion tokens, and cost per step |
+| **Errors** | Which step threw, with the full input that caused it |
+| **Trace tree** | Parent → child relationship of every chain, tool, and agent call |
+
+### Setup — Three Environment Variables
+
+```bash
+# .env
+LANGCHAIN_TRACING_V2=true          # enables tracing globally
+LANGCHAIN_API_KEY=ls__your_key     # LangSmith API key
+LANGCHAIN_PROJECT=rag-freecodecamp # groups traces under a named project
+```
+
+No other code changes are needed. Every `chain.invoke()` call is automatically captured as a full trace.
+
+### `@traceable` — Trace Plain Python Functions
+
+For logic that lives outside LangChain components (validation, pre-processing, post-processing), wrap it with `@traceable` to include it as a named span in the trace tree:
+
+```python
+from langsmith import traceable
+
+@traceable(name="validate_query")
+def validate_query(query: str) -> str:
+    if not query.strip():
+        raise ValueError("Query must not be empty.")
+    return query.strip()
+
+@traceable(name="rag_pipeline")
+def run_rag(query: str) -> dict:
+    clean_query = validate_query(query)   # appears as a child span
+    answer = rag_chain.invoke(clean_query) # LangChain chain appears as a child span
+    return {"query": clean_query, "answer": answer}
+```
+
+The resulting trace tree in LangSmith looks like:
+```
+rag_pipeline
+  ├── validate_query          (your custom logic)
+  └── RunnableSequence        (LangChain chain)
+        ├── retriever         (vector search)
+        ├── ChatPromptTemplate
+        ├── ChatOpenAI        (LLM call — tokens, cost, latency)
+        └── StrOutputParser
+```
+
+### Manual Feedback — Log Human Signals on Runs
+
+After a user rates an answer (thumbs up / thumbs down), log that signal back to the run so it feeds your evaluation dataset:
+
+```python
+from langsmith import Client
+
+def log_feedback(run_id: str, score: int, comment: str = ""):
+    client = Client()
+    client.create_feedback(
+        run_id=run_id,
+        key="user_feedback",
+        score=score,        # 1 = correct, 0 = wrong
+        comment=comment,
+    )
+```
+
+Over time, these signals accumulate into a labeled dataset you can use to measure whether pipeline changes actually improve answer quality.
