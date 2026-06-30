@@ -56,9 +56,19 @@ uv run python main.py
 ```
 .
 ├── main.py                  # Entry point — LLM setup and test
-├── documentsloader1.py      # Document loaders (PDF, Text)
-├── chunkingEmbedding2.py    # Chunking strategies and embedding concepts
+├── A1_documentsloader1.py   # Document loaders (PDF, Text, Directory, Web)
+├── A2_chunkingEmbedding2.py # Chunking strategies and embedding concepts
+├── A3_ragpipeline3.py       # Basic RAG pipeline + RAG with source attribution
+├── A4_textSplitter4.py      # Advanced text splitter strategies
+├── A5_embeddings_deep5.py   # Deep dive into embeddings
+├── A6_hybridSearch.py       # Hybrid search with BM25 + EnsembleRetriever
+├── A7_costOptimization.py   # Token budgeting and cost optimization
+├── A8_langsmith_setup.py    # LangSmith observability and tracing
+├── A9_semanticChunking.py   # Semantic chunking
+├── A10_prodReady.py         # Production-ready RAG patterns
+├── A11_advanced_rag.py      # Advanced retrieval: Multi-Query, Compression, Parent-Child
 ├── docs/                    # Sample PDF documents
+├── vector_store/            # Persisted Chroma vector database
 ├── .env                     # API keys (never commit this)
 └── pyproject.toml           # Dependencies
 ```
@@ -69,28 +79,32 @@ uv run python main.py
 
 | Package | Purpose |
 |---|---|
+| Package | Purpose |
+|---|---|
 | `langchain` | Chains, retrievers, document loaders |
 | `langchain-core` | Base abstractions (Runnable, BaseMessage) |
-| `langchain-anthropic` | Claude integration for LangChain |
+| `langchain-openai` | OpenAI LLM and embedding integration |
+| `langchain-chroma` | Chroma vector store integration |
 | `langchain-community` | Community integrations (PDF loaders, etc.) |
-| `anthropic` | Anthropic SDK |
-| `langgraph` | Agent and graph-based workflows |
+| `langchain-classic` | Legacy retrievers: ParentDocumentRetriever, ContextualCompressionRetriever, MultiQueryRetriever |
+| `langsmith` | Tracing and evaluation platform |
+| `openai` | OpenAI SDK |
 | `python-dotenv` | Load `.env` variables |
 
-> **Note:** `langchain-community` is being sunset. Prefer standalone packages (e.g. `langchain-pypdf`) when available.
+> **Note:** `langchain-community` is being sunset. Prefer standalone packages (e.g. `langchain-pypdf`) when available. `langchain-classic` bundles retrievers that were moved out of `langchain` core.
 
 ---
 
 ## Model
 
-Uses **Claude Haiku 4.5** (`claude-haiku-4-5`) — fast and cost-effective, ideal for learning and experimentation.
+Uses **GPT-4o Mini** (`gpt-4o-mini`) via `init_chat_model` — fast and cost-effective, ideal for learning and experimentation.
 
 ```python
-from langchain_anthropic import ChatAnthropic
-llm = ChatAnthropic(model="claude-haiku-4-5", temperature=0)
+from langchain.chat_models import init_chat_model
+llm = init_chat_model(model="gpt-4o-mini", temperature=0.2)
 ```
 
-`temperature=0` makes responses deterministic — important for RAG where consistency matters.
+`temperature=0` makes responses deterministic — important for RAG where consistency matters. `init_chat_model` is a provider-agnostic factory that works with OpenAI, Anthropic, and others by swapping the model string.
 
 ---
 
@@ -189,6 +203,172 @@ A vector database stores embeddings and enables fast similarity search to find t
 | **3. Test retrieval separately** | Validate retrieval performance independent of generation — isolates issues and makes debugging easier. |
 
 
+
+---
+
+## RAG with Source Attribution
+
+A common production requirement is showing the user **which document** each part of the answer came from. This is done by including source metadata in the formatted context before it reaches the LLM.
+
+### How It Works
+
+Instead of concatenating raw chunk text, each chunk is prefixed with its source path so the LLM can reference it in the answer:
+
+```python
+def format_docs_with_sources(docs):
+    formatted = []
+    for i, doc in enumerate(docs):
+        source = doc.metadata.get("source", "unknown")
+        formatted.append(f"[{i+1}] {source}:\n{doc.page_content}")
+    return "\n\n".join(formatted)
+```
+
+The prompt then instructs the LLM to include which sources it used:
+
+```python
+prompt = ChatPromptTemplate.from_template("""
+Answer the question based on the context below. Include which sources you used.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer (include sources):""")
+```
+
+### Why Source Attribution Matters
+
+| Without attribution | With attribution |
+|---|---|
+| LLM answer is a black box | User can verify claims against source documents |
+| Hallucinations are invisible | Hallucinated facts have no matching source citation |
+| Debugging requires re-running retrieval | Source label instantly shows which chunk drove the answer |
+
+Source attribution is the first step toward **faithfulness evaluation** — checking that every claim in the answer is traceable to a retrieved chunk.
+
+---
+
+## Advanced RAG Retrieval
+
+Standard similarity search (`k` nearest neighbors) often returns irrelevant chunks or misses relevant ones when the query phrasing doesn't match the document phrasing. Advanced retrieval strategies fix this.
+
+### 1. Multi-Query Retriever
+
+**Problem:** A single query vector may miss documents that use different vocabulary to express the same idea.
+
+**Solution:** Generate multiple rephrased versions of the query using an LLM, run each through the retriever, and deduplicate the results. More query perspectives = better recall.
+
+```python
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+
+retriever = MultiQueryRetriever.from_llm(
+    retriever=vectorstore.as_retriever(search_kwargs={"k": 2}),
+    llm=llm
+)
+
+# The retriever internally generates ~3 query variations and retrieves for each
+docs = retriever.invoke("What tools can I use to build AI applications?")
+```
+
+**When to use:** When users ask open-ended, conceptual questions where the exact wording varies. Adds one extra LLM call per query.
+
+**Enable logging to see generated queries:**
+```python
+import logging
+logging.getLogger("langchain.retrievers.multi_query").setLevel(logging.INFO)
+```
+
+---
+
+### 2. Contextual Compression Retriever
+
+**Problem:** Retrieved chunks contain relevant information *buried inside* mostly irrelevant content. The LLM receives noise alongside the signal, degrading answer quality.
+
+**Solution:** After retrieval, pass each chunk through an LLM compressor that extracts only the query-relevant sentences. The LLM receives compressed, high-signal content.
+
+```python
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import LLMChainExtractor
+
+compressor = LLMChainExtractor.from_llm(llm)
+
+compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor,
+    base_retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
+)
+
+docs = compression_retriever.invoke("What frameworks exist for building LLM applications?")
+# Returns short, extracted snippets instead of full 500-token chunks
+```
+
+**Trade-off:**
+
+| | Without Compression | With Compression |
+|---|---|---|
+| Chunk size sent to LLM | 300–500 tokens each | 20–80 tokens each |
+| LLM calls | 1 (generation only) | 1 per retrieved chunk + 1 for generation |
+| Answer quality when docs have noise | Degrades | Stays high |
+
+**When to use:** When your documents contain relevant facts embedded in large blocks of irrelevant surrounding text (e.g., a company history document that also mentions LangChain in passing).
+
+---
+
+### 3. Parent Document Retriever
+
+**Problem:** There is a tension between chunk size for retrieval and chunk size for context:
+- **Small chunks** → precise embedding matches, but strip surrounding context
+- **Large chunks** → richer context for the LLM, but noisy embeddings that retrieve off-topic content
+
+**Solution:** Index small child chunks for retrieval precision, but return the large parent chunk they came from so the LLM gets full context.
+
+```python
+from langchain_classic.retrievers import ParentDocumentRetriever
+from langchain_classic.storage import InMemoryStore
+
+parent_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+
+vectorstore = Chroma(collection_name="parent_child_demo", embedding_function=embeddings)
+store = InMemoryStore()  # stores parent chunks by ID
+
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,   # searches small child chunks
+    docstore=store,            # fetches large parent chunks
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+
+retriever.add_documents([long_doc])
+parent_docs = retriever.invoke("What is LangGraph used for?")
+# Returns the 800-token parent chunk, not the 200-token child that matched
+```
+
+**How the two-store architecture works:**
+
+```
+Indexing:
+  Document → parent_splitter → Parent Chunks (stored in docstore with ID)
+                              → child_splitter → Child Chunks (stored in vectorstore, tagged with parent ID)
+
+Retrieval:
+  Query → embed → search vectorstore → find matching Child Chunk
+       → look up parent ID → fetch Parent Chunk from docstore → return to LLM
+```
+
+**When to use:** Long documents (guides, manuals, reports) where precise retrieval matters but the answer requires surrounding context to be complete.
+
+---
+
+### Comparison: Which Advanced Retriever to Use?
+
+| Strategy | Fixes | Cost | When to Use |
+|---|---|---|---|
+| **Multi-Query** | Vocabulary mismatch, low recall | +1 LLM call per query | Open-ended, conceptual queries |
+| **Contextual Compression** | Noisy chunks, irrelevant context | +1 LLM call per chunk | Docs with relevant info buried in noise |
+| **Parent Document** | Small-chunk context loss | No extra LLM calls | Long documents needing surrounding context |
+
+These strategies can be **combined**: e.g., Multi-Query → Parent Document → Contextual Compression for maximum retrieval quality at higher cost.
 
 ---
 
@@ -629,3 +809,239 @@ def log_feedback(run_id: str, score: int, comment: str = ""):
 ```
 
 Over time, these signals accumulate into a labeled dataset you can use to measure whether pipeline changes actually improve answer quality.
+
+---
+
+## HNSW — How Vector Databases Find Similar Vectors Quickly
+
+When you store embeddings in a vector database and run a similarity search, the database does not compare your query against every single vector. That would be too slow at scale (millions of vectors). Instead, almost every major vector database (Pinecone, Weaviate, Qdrant, Milvus, FAISS) uses an algorithm called **HNSW — Hierarchical Navigable Small World** to find approximate nearest neighbors in milliseconds.
+
+> **Interview one-liner:** HNSW is an approximate nearest neighbor (ANN) algorithm that builds a multi-layer graph of vectors so search skips most of the data and navigates only through well-connected "shortcut" nodes.
+
+### How HNSW Works (Simple Mental Model)
+
+Think of it like a highway system:
+- **Top layers** = highways with few nodes but long-range connections (fast, coarse navigation)
+- **Bottom layers** = local roads with many nodes and short-range connections (slow, precise navigation)
+
+At query time, the algorithm enters at the top layer and greedily jumps toward the query vector, dropping down layer by layer until it reaches the bottom where it finds the actual nearest neighbors. This is why it is fast: it skips 99% of the data.
+
+```
+Layer 2  (few nodes, wide connections — "highway")
+Layer 1  (more nodes — "city roads")
+Layer 0  (all nodes, dense connections — "local streets")
+```
+
+### The 3 Core Parameters to Know
+
+#### M — Max Connections per Node
+
+Controls how many neighbor-links each node keeps in the graph.
+
+| M value | Memory | Build speed | Recall (accuracy) | Typical use |
+|---|---|---|---|---|
+| Low (8–12) | Low | Fast | Lower | Resource-constrained environments |
+| Medium (16–32) | Moderate | Moderate | Good | **Production sweet spot** |
+| High (48–64) | High | Slow | Best | When accuracy is critical and memory is not a concern |
+
+> Changing M requires **rebuilding the entire index** — it is not a runtime setting.
+
+#### efSearch — How Hard the Algorithm Looks at Query Time
+
+At query time, this controls how many candidate nodes the algorithm explores before returning results. This is the parameter you will tune most in production.
+
+| efSearch | Query speed | Recall | Notes |
+|---|---|---|---|
+| Low (10–30) | Fast | Lower | May miss the true best match |
+| Medium (50–100) | Balanced | Good | **Recommended starting point** |
+| High (200+) | Slow | Best | Use when accuracy is more important than latency |
+
+- Must be ≥ `k` (the number of results you want back)
+- Can be changed at **runtime without rebuilding the index** — tune it live
+
+#### efConstruction — How Hard the Algorithm Looks at Build Time
+
+When the index is being built, this controls how thoroughly the algorithm searches for good neighbors to connect each new node to. A higher value builds a "smarter" graph.
+
+| efConstruction | Build time | Graph quality | Typical use |
+|---|---|---|---|
+| 100 | Fast | Acceptable | Quick prototyping |
+| 100–200 | Moderate | Good | **Production default** |
+| 400+ | Slow | Best | Offline batch indexing where quality > speed |
+
+> Like M, this is a **build-time setting** — changing it means rebuilding the index.
+
+### The HNSW Tradeoff Triangle
+
+Every HNSW configuration is a tradeoff between three competing goals. You cannot optimize all three at the same time — improving one always costs another.
+
+```
+         Speed
+        /     \
+       /       \
+      /         \
+  Memory ——— Accuracy (Recall)
+```
+
+| If you want more... | Increase | Cost |
+|---|---|---|
+| **Accuracy (Recall)** | M, efSearch, efConstruction | More memory + slower build/search |
+| **Speed** | Lower efSearch | Lower recall — might miss best matches |
+| **Memory savings** | Lower M | Worse graph quality, lower recall |
+
+### ANN vs Exact Search — Why "Approximate" is OK
+
+HNSW is **approximate** nearest neighbor — it does not guarantee finding the mathematically closest vector. It finds *very close* neighbors very quickly.
+
+| | Exact Nearest Neighbor | ANN (HNSW) |
+|---|---|---|
+| Guarantee | Always returns the best match | Returns the best match ~95–99% of the time |
+| Speed at 1M vectors | O(n) — slow | O(log n) — milliseconds |
+| Production use | Rarely used | Industry standard |
+
+For RAG, a 99% recall is more than sufficient — a slightly sub-optimal chunk still leads to a correct answer in almost all cases.
+
+---
+
+## Self-Hosted vs Managed Vector Database
+
+Once you move beyond prototyping, you need to decide how to run your vector database in production. There are two paths.
+
+**Self-hosted** means you run the vector database yourself — on your own VMs, Kubernetes cluster, or bare metal (e.g. Qdrant, Milvus, Weaviate, or pgvector on your own Postgres).
+
+**Managed** means a vendor runs it for you and exposes an API (e.g. Pinecone, Weaviate Cloud, Qdrant Cloud, MongoDB Atlas Vector Search).
+
+### Comparison Table
+
+| | Self-Hosted | Managed |
+|---|---|---|
+| **Cost at low scale** | Low (just infra) | Can be expensive (per-vector pricing) |
+| **Cost at high scale** | Cheaper | Expensive — pricing grows with vector count |
+| **Operational burden** | High — you handle upgrades, backups, scaling, monitoring | Low — vendor handles everything |
+| **Data privacy / compliance** | Full control — data never leaves your infra | Data leaves your network; check vendor's compliance certs |
+| **Latency** | Low if deployed close to your app | Depends on vendor region |
+| **Scaling** | Manual (you provision more VMs/pods) | Automatic (vendor scales for you) |
+| **Time to first query** | Days (setup, config, ops) | Minutes (sign up and get an API key) |
+| **Customization** | Full control over HNSW params, hardware, schema | Limited to what the vendor exposes |
+
+### When to Choose Each
+
+| Scenario | Recommendation |
+|---|---|
+| Prototype / learning | **Managed** — get up and running in minutes |
+| Compliance-heavy industry (healthcare, finance) | **Self-hosted** — data must not leave your network |
+| Early startup, small team | **Managed** — no ops burden |
+| Large scale (50M+ vectors, cost-sensitive) | **Self-hosted** — per-vector managed pricing becomes expensive |
+| Need fine-grained HNSW tuning | **Self-hosted** — full parameter control |
+| No dedicated ML/infra team | **Managed** — vendor handles reliability and upgrades |
+
+> **Interview tip:** The managed vs self-hosted decision is rarely purely technical — it is usually driven by data compliance requirements, team size, and cost at scale. Know all three angles.
+
+### Popular Options
+
+| Type | Options |
+|---|---|
+| **Self-hosted** | Qdrant, Milvus, Weaviate (open source), pgvector (Postgres extension), FAISS (in-memory, no persistence) |
+| **Managed** | Pinecone, Weaviate Cloud, Qdrant Cloud, MongoDB Atlas Vector Search, Azure AI Search |
+
+---
+
+## Cost Optimization Strategies for Vector Databases
+
+Vector database costs grow with the number of vectors stored and the number of queries per second. These are the highest-impact levers you can pull to reduce costs without sacrificing meaningful quality.
+
+### 1. Reduce Dimensions
+
+Shrink the size of each embedding vector. For example, going from 1,536 dimensions (OpenAI `text-embedding-3-small`) down to 512 dimensions using the model's built-in dimension reduction.
+
+| | Before | After |
+|---|---|---|
+| Dimensions | 1,536 | 512 |
+| Storage per vector | 6.1 KB | 2.0 KB |
+| Savings | — | **30–60% storage reduction** |
+| Quality impact | Baseline | Slightly lower recall — test before committing |
+
+**How:** OpenAI's `text-embedding-3-*` models support native dimension reduction via the `dimensions` parameter. Re-embed and re-index after changing.
+
+**Effort:** Low
+
+---
+
+### 2. Quantization — Shrink Each Number
+
+Each dimension in an embedding is stored as a 32-bit float by default. Quantization compresses it to a smaller format (e.g. 8-bit integer), reducing memory with minimal accuracy loss.
+
+| Format | Bytes per dimension | Savings vs float32 | Quality |
+|---|---|---|---|
+| `float32` (default) | 4 bytes | — | Baseline |
+| `int8` (scalar quantization) | 1 byte | **75% reduction** | ~1-2% recall drop |
+| Binary (1 bit) | 0.125 bytes | **97% reduction** | Noticeable recall drop — only for extreme scale |
+
+**When to use:** Qdrant, Weaviate, Milvus all support built-in quantization. Enable it on large indexes where memory is the bottleneck.
+
+**Effort:** Medium (requires re-indexing and recall testing)
+
+---
+
+### 3. Batch Queries
+
+Instead of sending one embedding request per user query, batch multiple queries into a single API call. The embedding model processes them together, reducing per-request overhead.
+
+```python
+# Instead of this (N separate API calls):
+for query in user_queries:
+    embedding = embed(query)
+
+# Do this (1 API call):
+embeddings = embed_batch(user_queries)
+```
+
+**Savings:** 10–30% on embedding API costs
+**Effort:** Low — typically a one-line change in your embedding call
+
+---
+
+### 4. Cache Frequent Queries
+
+Many users ask the same questions (e.g. "What is your return policy?"). Cache the retrieved chunks and/or the final answer so identical queries skip the embedding and vector search entirely.
+
+```
+First request:   Query → Embed → VectorDB Search → LLM → Answer  (full cost)
+Cached request:  Query → Cache Hit → Return cached Answer          (near-zero cost)
+```
+
+**What to cache:** The final answer (cheapest — skips everything), or the retrieved chunks (skips vector search but still calls the LLM).
+
+**Savings:** 10–40% depending on query distribution
+**Effort:** Medium — requires a cache layer (Redis is common) and a cache key strategy (hash of the query string)
+
+> **Interview tip:** Caching works best when your query distribution has a "long tail" — a small set of popular questions asked by many users.
+
+---
+
+### 5. Right-Size Your Index (Don't Over-Provision)
+
+Vector databases, especially managed ones, charge for provisioned capacity — not just what you use. Spinning up a pod sized for 10M vectors when you only have 500K vectors wastes 95% of your budget.
+
+**Steps:**
+1. Measure your actual vector count and query throughput
+2. Pick the smallest tier that meets your latency SLA
+3. Set up auto-scaling if the vendor supports it
+4. Re-evaluate every quarter as your data grows
+
+**Savings:** 20–50% for teams that started with a "safe" large instance and never right-sized
+**Effort:** Low — mostly configuration, not code
+
+---
+
+### Cost Optimization Summary
+
+| Strategy | Savings | Effort | When to Use |
+|---|---|---|---|
+| **Reduce dimensions** | 30–60% | Low | When using a model that supports native reduction (e.g. OpenAI `text-embedding-3-*`) |
+| **Quantization** | 50–75% | Medium | Large indexes where memory cost dominates |
+| **Batch queries** | 10–30% | Low | Any pipeline that processes queries one at a time |
+| **Caching** | 10–40% | Medium | Knowledge bases with a high rate of repeated queries |
+| **Right-size** | 20–50% | Low | Any managed deployment that was provisioned without benchmarking |
+
+> **Interview tip:** Cost optimization is not premature optimization — it is operational discipline. In production, a 60% storage reduction from dimension reduction + quantization together means you can store 2.5× more vectors for the same price, or cut your bill by 60% on the same dataset.
