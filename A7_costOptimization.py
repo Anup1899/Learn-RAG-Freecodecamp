@@ -1,6 +1,7 @@
 import hashlib
 
-from langchain_openai import ChatOpenAI
+import numpy as np
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langsmith import traceable
 from dotenv import load_dotenv
 from qdrant_client.models import Optional
@@ -202,16 +203,9 @@ def demo_caching():
     print(f"\nStats: {llm.get_stats()}")
 
 
-if __name__ == "__main__":
-    # demo_model_routing()
-    demo_caching()
-    # demo_token_budgeting()
-
-
-
 # Drawback of the above approach:
-# Cache miss for semantically similar queries that are not identical. 
-    # Example: "What is AI?" and "Explain artificial intelligence" would be treated as different queries, even though they are semantically similar. 
+# Cache miss for semantically similar queries that are not identical.
+    # Example: "What is AI?" and "Explain artificial intelligence" would be treated as different queries, even though they are semantically similar.
         # Differnt hash values would be generated for these queries, leading to a cache miss and an unnecessary LLM call.
 # Solution: Implement semantic caching using embeddings to compare the similarity of queries rather than relying on exact string matches.
 # Step 1 : Embed the query into a vector
@@ -219,3 +213,117 @@ if __name__ == "__main__":
 # Step 3 : If a similarity > threshold is found, return the cached response; otherwise, call the LLM and store the new query-response pair in the cache.
 
 
+class EmbeddingSemanticCache:
+    """Semantic cache that matches queries by embedding similarity instead of exact hashes."""
+
+    def __init__(self, similarity_threshold: float = 0.85):
+        self.cache: list[dict] = []
+        self.threshold = similarity_threshold
+        self.embedder = OpenAIEmbeddings(model="text-embedding-3-small")
+
+    @staticmethod
+    def cosine_similarity(vec1, vec2) -> float:
+        return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+    def get(self, query: str) -> tuple[Optional[str], float]:
+        """Find the closest cached query. Returns (response, similarity) or (None, best_similarity)."""
+        if not self.cache:
+            return None, 0.0
+
+        query_vector = self.embedder.embed_query(query)
+
+        best_entry, best_score = None, 0.0
+        for entry in self.cache:
+            score = self.cosine_similarity(query_vector, entry["embedding"])
+            if score > best_score:
+                best_entry, best_score = entry, score
+
+        if best_entry and best_score >= self.threshold:
+            return best_entry["response"], best_score
+
+        return None, best_score
+
+    def set(self, query: str, response: str):
+        """Store the query's embedding alongside its response."""
+        embedding = self.embedder.embed_query(query)
+        self.cache.append({"query": query, "embedding": embedding, "response": response})
+
+    def stats(self) -> dict:
+        return {"cached_queries": len(self.cache)}
+
+
+class SemanticCachedLLM:
+    """LLM wrapper that reuses responses for semantically similar queries."""
+
+    def __init__(self, similarity_threshold: float = 0.85):
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.cache = EmbeddingSemanticCache(similarity_threshold=similarity_threshold)
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    @traceable(name="semantic_cached_invoke")
+    def invoke(self, query: str) -> tuple[str, bool, float]:
+        """
+            Invoke LLM with embedding-based semantic caching.
+            Returns:
+                - response: str
+                - from_cache: bool
+                - similarity: float (similarity to the closest cached query)"""
+
+        # Check cache by embedding similarity
+        cached_response, similarity = self.cache.get(query)
+        if cached_response is not None:
+            self.cache_hits += 1
+            return cached_response, True, similarity
+
+        # If no sufficiently similar query is cached, call the LLM
+        response = self.llm.invoke(query)
+        result = response.content
+
+        # Store the new query-response pair in the cache
+        self.cache.set(query, result)
+        self.cache_misses += 1
+
+        return result, False, similarity
+
+    def get_stats(self) -> dict:
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total > 0 else 0
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": f"{hit_rate:.2%}",
+            **self.cache.stats(),
+        }
+
+
+def demo_semantic_caching():
+    """Demonstrate embedding-based semantic caching."""
+
+    llm = SemanticCachedLLM(similarity_threshold=0.7)
+
+    queries = [
+        "What is AI?",
+        "Explain artificial intelligence",  # Semantically similar -> cache hit
+        "What is the capital of France?",
+        "What's the capital city of France?",  # Semantically similar -> cache hit
+        "What is quantum computing?",
+    ]
+
+    print("\nSemantic Caching Demo:\n")
+
+    for query in queries:
+        result, from_cache, similarity = llm.invoke(query)
+        source = f"CACHE ({similarity:.2f})" if from_cache else f"LLM ({similarity:.2f})"
+        print(f"[{source}] {query} -> {result[:30]}...")
+
+    print(f"\nStats: {llm.get_stats()}")
+
+
+
+
+if __name__ == "__main__":
+    # demo_model_routing()
+    # demo_caching()
+    # demo_token_budgeting()
+    demo_semantic_caching()
