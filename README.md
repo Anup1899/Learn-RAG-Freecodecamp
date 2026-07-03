@@ -1001,7 +1001,7 @@ embeddings = embed_batch(user_queries)
 
 ---
 
-### 4. Cache Frequent Queries
+### 4. Cache Frequent Queries (Semantic Caching)
 
 Many users ask the same questions (e.g. "What is your return policy?"). Cache the retrieved chunks and/or the final answer so identical queries skip the embedding and vector search entirely.
 
@@ -1011,6 +1011,38 @@ Cached request:  Query → Cache Hit → Return cached Answer          (near-zer
 ```
 
 **What to cache:** The final answer (cheapest — skips everything), or the retrieved chunks (skips vector search but still calls the LLM).
+
+**Two-layer cache key strategy** — a naive cache keyed on the raw query string misses obvious duplicates like `"What is AI?"` vs `"what is ai?"`. Two layers fix this:
+
+1. **Normalize** — lowercase, strip whitespace, remove punctuation, etc. `"What is AI?"` and `"what is ai?"` both normalize to `"what is ai"`, so they're treated as the same query.
+2. **Hash** — run the normalized query through a hash function (e.g. SHA-256) and use the hash as the cache key. This keeps the key a fixed length regardless of query length, so lookups stay cheap even for long or verbose queries.
+
+```python
+import hashlib
+import re
+
+def cache_key(query: str) -> str:
+    normalized = re.sub(r"[^\w\s]", "", query.lower().strip())
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+cache_key("What is AI?") == cache_key("what is ai?")  # True — same cache entry
+```
+
+**Drawback of hash-based caching:** it only catches queries that are identical after normalization. Semantically similar but differently-worded queries still miss:
+
+```
+"What is AI?" vs "Explain artificial intelligence"
+→ Different strings → different hashes → cache miss → unnecessary LLM call,
+  even though the two queries mean the same thing.
+```
+
+**Solution — embedding-based semantic caching:** compare queries by meaning instead of exact string match.
+
+1. **Embed** the incoming query into a vector.
+2. **Search** the cache by vector similarity (e.g. cosine similarity) against previously cached query embeddings.
+3. **Threshold check** — if the best match's similarity exceeds a threshold (e.g. `0.9`), return its cached response; otherwise call the LLM and store the new query-response pair (with its embedding) in the cache.
+
+This catches paraphrases and reduces LLM calls further than hash-based caching alone, at the cost of an embedding call per lookup and a vector-similarity search instead of an O(1) dict lookup.
 
 **Savings:** 10–40% depending on query distribution
 **Effort:** Medium — requires a cache layer (Redis is common) and a cache key strategy (hash of the query string)
