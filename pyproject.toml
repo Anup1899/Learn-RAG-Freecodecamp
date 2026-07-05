@@ -23,8 +23,3 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "voyageai>=0.3.7",
 ]
-
-[tool.uv.workspace]
-members = [
-    "Project",
-]
