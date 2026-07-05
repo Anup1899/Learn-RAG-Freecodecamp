@@ -14,6 +14,7 @@ dependencies = [
     "langchain-core>=1.4.0",
     "langchain-experimental>=0.4.2",
     "langchain-openai>=1.2.2",
+    "langchain-postgres>=0.0.17",
     "langgraph>=1.2.2",
     "protobuf<4",
     "pypdf>=6.12.2",
@@ -21,4 +22,9 @@ dependencies = [
     "qdrant-client>=1.18.0",
     "rank-bm25>=0.2.2",
     "voyageai>=0.3.7",
+]
+
+[tool.uv.workspace]
+members = [
+    "Project",
 ]

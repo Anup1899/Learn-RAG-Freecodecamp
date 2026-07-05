@@ -67,6 +67,7 @@ uv run python main.py
 ├── A9_semanticChunking.py   # Semantic chunking
 ├── A10_prodReady.py         # Production-ready RAG patterns
 ├── A11_advanced_rag.py      # Advanced retrieval: Multi-Query, Compression, Parent-Child
+├── A12_monitoring.py        # Structured logging and production monitoring
 ├── docs/                    # Sample PDF documents
 ├── vector_store/            # Persisted Chroma vector database
 ├── .env                     # API keys (never commit this)
@@ -1077,3 +1078,23 @@ Vector databases, especially managed ones, charge for provisioned capacity — n
 | **Right-size** | 20–50% | Low | Any managed deployment that was provisioned without benchmarking |
 
 > **Interview tip:** Cost optimization is not premature optimization — it is operational discipline. In production, a 60% storage reduction from dimension reduction + quantization together means you can store 2.5× more vectors for the same price, or cut your bill by 60% on the same dataset.
+
+---
+
+## Monitoring: The Three Pillars of Production Visibility
+
+Once a RAG pipeline is live, monitoring is what tells you it's actually working — without it, failures like the ones above (bad chunking, hallucination, cost surprises) go unnoticed until a user complains.
+
+1. **Structured Logging** — A human-readable story of what happened, in a machine-parseable format (e.g. JSON) so logs can be searched, filtered, and aggregated.
+2. **Metrics Collection** — Numbers on a dashboard (latency, token usage, error rate, cache hit rate) that reveal trends over time.
+3. **Instrumented LLM Calls** — Wrapping every LLM call so its inputs, outputs, tokens, latency, and cost are captured automatically.
+
+> **Monitoring is the outermost layer** — it observes everything happening in the system but does not change the system's behavior.
+
+**Where monitoring fits in the production stack:**
+
+```
+Security -> Cost Optimization -> Error Handling -> Monitoring
+```
+
+Security and cost/error handling shape *how* the system behaves; monitoring only watches and reports on that behavior after the fact.
