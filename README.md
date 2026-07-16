@@ -68,6 +68,12 @@ uv run python main.py
 ├── A10_prodReady.py         # Production-ready RAG patterns
 ├── A11_advanced_rag.py      # Advanced retrieval: Multi-Query, Compression, Parent-Child
 ├── A12_monitoring.py        # Structured logging and production monitoring
+├── A13_LongContextVsRAG.py  # Long context vs RAG: cost, latency, decision framework, hybrid demo
+├── A14_ContextualRetrival.py # Contextual Retrieval — LLM-generated context prefixes before embedding
+├── A15_lateChunking.py      # Late chunking — embed full doc, then split embeddings
+├── A16_agenticRAGpy         # Agentic RAG with LangGraph — retrieve, grade, retry, generate
+├── A17_graphRAGIntro.py     # GraphRAG — knowledge graphs for multi-hop reasoning
+├── A18_multiModelRAG.py     # Multimodal RAG with ColPali — vision-based document understanding
 ├── docs/                    # Sample PDF documents
 ├── vector_store/            # Persisted Chroma vector database
 ├── .env                     # API keys (never commit this)
@@ -91,6 +97,10 @@ uv run python main.py
 | `langsmith` | Tracing and evaluation platform |
 | `openai` | OpenAI SDK |
 | `python-dotenv` | Load `.env` variables |
+| `langgraph` | Cyclic, stateful agent workflows (used for Agentic RAG) |
+| `tiktoken` | Token counting for OpenAI models (cost estimation, budget checks) |
+
+> **Missing dependency:** `A17_graphRAGIntro.py` imports `networkx` to build the knowledge graph, but it is not yet declared in `pyproject.toml` / `uv.lock`. Run `uv add networkx` before running that script.
 
 > **Note:** `langchain-community` is being sunset. Prefer standalone packages (e.g. `langchain-pypdf`) when available. `langchain-classic` bundles retrievers that were moved out of `langchain` core.
 
@@ -1098,3 +1108,414 @@ Security -> Cost Optimization -> Error Handling -> Monitoring
 ```
 
 Security and cost/error handling shape *how* the system behaves; monitoring only watches and reports on that behavior after the fact.
+
+---
+
+## Long Context vs RAG — When to Use Each
+
+Modern LLMs support huge context windows (1M+ tokens for some models), which raises an obvious question: **is RAG dead?** The answer is no — the choice between stuffing an entire corpus into the prompt ("long context") and retrieving only the relevant pieces ("RAG") is a tradeoff between **cost, latency, and use case**, not a strict upgrade path.
+
+> **The real answer isn't "RAG vs Long Context" — it's "RAG AND Long Context."** Use both strategically.
+
+### Cost Comparison
+
+Cost scales directly with input tokens, so stuffing 100K tokens of docs into every query is dramatically more expensive than retrieving a handful of relevant chunks.
+
+**Scenario:** Query against 100,000 tokens of documentation. Query: 100 tokens, expected output: 500 tokens.
+
+| Approach | Input tokens | Cost per query |
+|---|---|---|
+| **Long Context** (stuff everything) | 100,100 | $0.25525 |
+| **RAG** (4 chunks × 500 tokens) | 2,100 | $0.01025 |
+
+RAG is **~25x cheaper per query** in this scenario.
+
+**At scale (10,000 queries/day):**
+
+| Approach | Daily cost | Monthly cost |
+|---|---|---|
+| Long Context | $2,552.50 | ~$76,575 |
+| RAG | $102.50 | ~$3,075 |
+| **Savings with RAG** | — | **~$73,500/month** |
+
+> Pricing example uses $2.50/1M input tokens and $10.00/1M output tokens. The multiplier only grows as the document corpus grows — at 1M tokens of docs, long context cost scales roughly 10x further while RAG cost stays flat (it only depends on `k` and chunk size, not corpus size).
+
+### Latency Comparison
+
+More input tokens means more tokens for the model to process before it can start generating a response. RAG's smaller, targeted context is usually faster to process than a massive stuffed context — though at small scales (a few thousand tokens) the difference can be negligible or even noisy, since network/queueing variance dominates. The gap becomes dramatic once you're in the 100K+ token range, where the model has to attend over far more tokens per request.
+
+| Context size | Effect on latency |
+|---|---|
+| Small (~50–500 tokens) | Minimal difference vs long context — variance dominates |
+| Medium (~2,500 tokens) | Difference becomes measurable |
+| Large (100K+ tokens) | Long context latency grows substantially; RAG latency stays roughly constant |
+
+### Why Long Context Isn't Always Better
+
+Beyond raw cost and latency, stuffing huge amounts of text into a single prompt has quality risks that don't show up in a token-count comparison:
+
+- **"Lost in the middle" effect** — research on long-context models shows retrieval accuracy is highest for information near the *start* or *end* of the prompt, and measurably worse for facts buried in the middle. A 100K-token stuffed prompt doesn't guarantee the model actually "sees" every fact equally well.
+- **No citations by default** — long context gives the model everything at once with no structural signal of *which passage* an answer came from, making source attribution harder to bolt on than in RAG (where each chunk already carries `metadata.source`).
+- **Reprocessing cost on every change** — if a document changes, long context means re-sending (and re-paying for) the entire corpus on the next query. RAG only needs to re-embed and re-index the changed chunk.
+- **Prompt caching changes the math (partially)** — providers like Anthropic and OpenAI support prompt/context caching, which can cut the cost of *repeated* queries against the *same* large context by up to ~90%. This narrows the cost gap for a static corpus queried repeatedly without changes, but doesn't help if the corpus is large *and* changes frequently *and* query volume is high — RAG still wins there.
+
+### Decision Framework
+
+**Use Long Context when:**
+- Document corpus is small (< 50K tokens)
+- Query volume is low (< 100 queries/day)
+- You need to analyze the **entire** document holistically (e.g. summarization, cross-referencing distant sections)
+- Documents change frequently (avoids embedding/re-indexing overhead)
+- Simplicity is worth more than cost optimization
+
+**Use RAG when:**
+- Document corpus is large (> 100K tokens)
+- Query volume is high (thousands of queries/day)
+- Users ask about specific topics rather than requesting whole-document analysis
+- Cost and latency matter
+- You need citations / source tracking
+- Documents are relatively stable
+
+| Factor | Favors Long Context | Favors RAG |
+|---|---|---|
+| Corpus size | Small (< 50K tokens) | Large (> 100K tokens) |
+| Query volume | Low (< 100/day) | High (1000s/day) |
+| Query type | Whole-document analysis | Specific, targeted questions |
+| Document volatility | Changes often | Relatively stable |
+| Cost sensitivity | Low priority | High priority |
+| Need for citations | Not required | Required |
+
+### Hybrid Approach: RAG + Long Context Together
+
+The two techniques compose well: use RAG to **find** the right document(s) cheaply, then load the **full** document into context for a detailed, complete answer — instead of relying on a small chunk that might be missing surrounding detail.
+
+```
+1. RAG retrieves the candidate document(s) via vector similarity search
+2. The full document (not just the matched chunk) is loaded into the LLM's context
+3. The LLM generates a comprehensive answer using the complete document
+```
+
+```python
+# Step 1: RAG finds the right document
+retriever = vectorstore.as_retriever(search_kwargs={"k": 1})
+relevant_docs = retriever.invoke(query)
+
+# Step 2: Load the FULL document into context (not just the matched chunk)
+full_doc = relevant_docs[0].page_content
+
+# Step 3: Generate a detailed answer with the complete document as context
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Use the full document below to give a comprehensive answer.\n\n{document}"),
+    ("human", "{query}"),
+])
+response = (prompt | llm).invoke({"document": full_doc, "query": query})
+```
+
+**Why this works well:**
+
+| Benefit | Explanation |
+|---|---|
+| Fast document discovery | RAG's vector search narrows thousands of documents down to the 1–2 relevant ones in milliseconds |
+| No missing context | The LLM sees the *entire* matched document, not a 500-token chunk that might cut off a relevant detail |
+| Still far cheaper than full corpus stuffing | You pay for one full document's tokens, not the entire knowledge base's tokens |
+| Best for | "Find the relevant doc, then analyze it thoroughly" — e.g. HR policy lookups, contract analysis, single-report Q&A |
+
+### Key Takeaways
+
+1. RAG is **not dead** — the tradeoff is about cost and latency at scale, not capability
+2. Long context wins for small corpora, low query volume, and whole-document analysis
+3. RAG wins for large corpora, high query volume, and targeted queries
+4. The hybrid approach — RAG to find the doc, long context to analyze it — combines the strengths of both
+5. The production answer is rarely "one or the other" — it's using both strategically depending on the query shape
+
+---
+
+## Contextual Retrieval (Anthropic's Technique)
+
+Chunking a document strips away the surrounding context each chunk depends on. A chunk that says *"The company plans to expand into renewable energy"* means nothing to an embedding model without knowing which company. Anthropic's **Contextual Retrieval** technique fixes this by having an LLM prepend a short, disambiguating context to every chunk **before** it gets embedded.
+
+### The Problem
+
+```
+Chunk 1: "The company" - Which company?
+Chunk 2: "fiscal year 2025" - For what company?
+Chunk 3: "The company plans" - Plans of what company?
+```
+
+A query like *"What is ACME's revenue?"* may fail to match Chunk 2 because the literal string "ACME" never appears in it — only the pronoun-like phrase "the company."
+
+### The Solution
+
+An LLM is given the **chunk** and the **full document** it came from, and asked to write a 1–2 sentence prefix that situates the chunk (entities, document title, relevant surrounding facts). That prefix is prepended to the chunk before embedding.
+
+```python
+def add_contextual_prefix(chunk, full_document, document_title, llm):
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Write a SHORT context (1-2 sentences) that helps "
+                   "situate the chunk within the document. Output ONLY the prefix."),
+        ("human", "Document Title: {title}\n\nFull Document:\n{document}\n\n"
+                  "Chunk to contextualize:\n{chunk}"),
+    ])
+    return (prompt | llm).invoke(
+        {"title": document_title, "document": full_document, "chunk": chunk}
+    ).content
+
+contextualized_chunk = f"{add_contextual_prefix(chunk, doc, title, llm)} {chunk}"
+```
+
+### Production Considerations
+
+| Factor | Impact |
+|---|---|
+| **Cost** | ~$0.01–$0.05 per document — a one-time indexing cost, far cheaper than retrieval failures |
+| **Latency** | +1–2s per chunk during indexing; no impact on query latency (batch process offline) |
+| **Storage** | Chunks grow ~20–30% larger — minimal effect on vector DB cost |
+| **Result** | Anthropic reports **67% fewer retrieval failures** |
+
+**When to use:** Documents with important context in headers/titles, entities referenced with pronouns ("the company", "they"), or corpora pulled from multiple sources. Combine with BM25 hybrid search for best results.
+
+*See [A14_ContextualRetrival.py](A14_ContextualRetrival.py) for the full runnable demo, including a side-by-side retrieval-score comparison between raw and contextualized chunks.*
+
+---
+
+## Late Chunking
+
+Contextual Retrieval fixes context loss by asking an LLM to describe it explicitly. **Late chunking** fixes the same problem architecturally: instead of splitting text and then embedding each piece independently, it **embeds the full document first**, then splits the resulting token-level embeddings into chunk vectors.
+
+### Early (Traditional) Chunking vs. Late Chunking
+
+```
+EARLY CHUNKING:                          LATE CHUNKING:
+Document → Split → Chunk 1, 2, 3         Document → Embed FULL doc (token embeddings)
+              ↓         ↓        ↓                        → Split embeddings by position
+          Embed     Embed    Embed                        → Vector 1, 2, 3 (pooled)
+              ↓         ↓        ↓
+         Vector 1  Vector 2  Vector 3
+
+Each chunk embedded INDEPENDENTLY.       Each chunk vector "knows" the whole document —
+No cross-chunk context.                  a pronoun like "he" is embedded with the
+                                          knowledge that "he" = "Steve Jobs."
+```
+
+**Example failure mode this fixes:** A biography chunked into sentences produces chunks like *"He co-founded Apple Computer in 1976"* with no mention of "Steve Jobs" — because that name appeared only in an earlier chunk. Under early chunking, a query for "companies Steve Jobs founded" may not match this chunk at all.
+
+### Implementation Options
+
+| Approach | Context Quality | Implementation Cost |
+|---|---|---|
+| Early chunking (traditional) | Poor — pronouns orphaned | Free — standard approach |
+| Overlapping chunks | Better — some context kept | Free — just a config change |
+| **Contextual Retrieval** | Excellent — LLM adds context | ~$0.01/doc (LLM cost) |
+| **Late chunking (native)** | Excellent — full doc context | Needs a model with token-level output (e.g. Jina Embeddings v3 with `late_chunking=True`) |
+| Parent-Child Retriever | Excellent — returns parent doc | Extra storage (2x vector store) |
+
+**Accuracy improvements vs. traditional chunking:** overlapping chunks +3–5%, Contextual Retrieval +15–20%, Late Chunking +10–12%, combined approaches +25–30%.
+
+> **Note:** True late chunking requires token-level embedding access (e.g. Jina models). OpenAI's standard embedding API doesn't expose this, so [A15_lateChunking.py](A15_lateChunking.py) demonstrates the *concept* via context-prepending rather than true token-level pooling.
+
+**Recommendation:** Start with Contextual Retrieval, since it works with any embedding model. Move to native late chunking (Jina) if you control the embedding model. Combine with a Parent Document Retriever for the best of both.
+
+---
+
+## Agentic RAG with LangGraph
+
+Traditional RAG is a **one-shot** pipeline: retrieve, then generate — with no way to recover if retrieval returns garbage. **Agentic RAG** turns this into a loop that can evaluate its own retrieval quality and self-correct: `retrieve → grade → [rewrite query and retry if needed] → generate`.
+
+### Why This Matters
+
+A single vector search can miss the answer simply because the user's phrasing doesn't match the document's vocabulary. A one-shot pipeline generates a confident (possibly wrong) answer anyway. Agentic RAG adds a **grading step** that catches this before generation ever happens.
+
+### Graph Structure
+
+```
+START → RETRIEVE → GRADE ──┬── (good relevance) ──────────────→ GENERATE → END
+                            ├── (low relevance, retries left) → REWRITE → back to RETRIEVE
+                            └── (no docs, out of retries) ────→ FALLBACK → END
+```
+
+Built with LangGraph's `StateGraph`, using a `TypedDict` state schema (LangGraph 1.x convention — not Pydantic):
+
+```python
+class RAGState(TypedDict):
+    query: str
+    rewritten_query: str
+    documents: list[Document]
+    generation: str
+    relevance_score: float
+    retry_count: int
+    max_retries: int
+
+workflow = StateGraph(RAGState)
+workflow.add_node("retrieve", retrieve_documents)
+workflow.add_node("grade", grade_documents)
+workflow.add_node("rewrite", rewrite_query)
+workflow.add_node("generate", generate_answer)
+workflow.add_node("fallback", generate_fallback)
+
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "grade")
+workflow.add_conditional_edges(
+    "grade", should_retry_or_generate,
+    {"rewrite": "rewrite", "generate": "generate", "fallback": "fallback"},
+)
+workflow.add_edge("rewrite", "retrieve")   # the self-correcting loop
+workflow.add_edge("generate", END)
+workflow.add_edge("fallback", END)
+
+app = workflow.compile()
+```
+
+### The Router: `should_retry_or_generate`
+
+This function is the decision-making core of the workflow — it inspects the average LLM-assigned relevance score (0–1 per document) and the retry budget to decide the next step:
+
+| Condition | Route |
+|---|---|
+| `relevance_score >= 0.5` and documents exist | → **generate** |
+| Low relevance, `retry_count < max_retries` | → **rewrite** (reformulate query, loop back to retrieve) |
+| Out of retries but some documents exist | → **generate** (best effort with what's available) |
+| Out of retries and zero documents | → **fallback** (graceful "I don't know" response) |
+
+**When to use Agentic RAG:** complex queries that may need reformulation, high-stakes applications where answer quality matters, diverse document types, user-facing (not batch) applications. The cost is extra LLM calls per grading/rewrite step — worth it when a wrong or "I don't know" answer is expensive.
+
+*See [A16_agenticRAGpy](A16_agenticRAGpy) for the full implementation, including a demo that runs three test queries — two that succeed on the first retrieval and one designed to exhaust all retries and hit the fallback path.*
+
+> **Note:** This file is currently named `A16_agenticRAGpy` (no `.py` extension) rather than `A16_agenticRAG.py` — likely a typo from when it was created. It is a valid Python script and runs fine as-is, but you may want to rename it for consistency with the other lesson files.
+
+---
+
+## GraphRAG — Multi-Hop Reasoning with Knowledge Graphs
+
+Vector similarity search answers "what documents are semantically similar to this query" — but it can't answer questions that require **traversing relationships** between entities across multiple documents.
+
+### The Multi-Hop Problem
+
+```
+Query: "Who works in the same department as the CEO's assistant?"
+
+Requires chaining:  CEO → CEO's assistant → their department → other employees in that department
+```
+
+Vector search for "CEO's assistant" won't semantically match a chunk like *"Sarah Johnson works in the Executive department"* — Sarah's name never appears in the query, so the embeddings don't align. This is a **multi-hop** problem: the answer requires following a chain of relationships, not matching a single semantically-similar passage.
+
+### The Solution: Knowledge Graphs
+
+GraphRAG extracts **entities** (nodes) and **relationships** (edges) from documents into a traversable graph, then answers multi-hop queries by walking the graph instead of (or in addition to) running vector search:
+
+```python
+G = nx.DiGraph()
+G.add_node("Sarah Johnson", type="Person", role="Executive Assistant")
+G.add_edge("Sarah Johnson", "John Smith", relation="ASSISTANT_TO")
+G.add_edge("Sarah Johnson", "Executive Department", relation="WORKS_IN")
+```
+
+In production, entity/relationship extraction is automated with an LLM rather than hand-built:
+
+```python
+extraction_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Extract ENTITIES (people, organizations, places, concepts) and "
+               "RELATIONSHIPS (WORKS_FOR, MANAGES, LOCATED_IN, etc.) from the text."),
+    ("human", "Extract entities and relationships from this text:\n\n{text}"),
+])
+```
+
+### GraphRAG Architecture — Two Phases
+
+```
+INDEXING:  Documents → LLM extracts entities/relations → Knowledge Graph
+                                                              ↓
+                                                     Community Detection (group related entities)
+                                                              ↓
+                                                     LLM generates community summaries
+
+QUERYING:  Two modes —
+  LOCAL SEARCH  (multi-hop reasoning): identify entities in query, traverse relationships
+  GLOBAL SEARCH (holistic themes):    aggregate knowledge via community summaries
+```
+
+### Implementation Options
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Microsoft GraphRAG** | Full-featured, production-ready, well-documented | Heavy — significant compute for indexing |
+| **LangGraph + Neo4j** (`GraphCypherQAChain`) | Full control, integrates with existing Neo4j | Must manage Neo4j, manual entity extraction |
+| **LlamaIndex `KnowledgeGraphIndex`** | Easy to use, good LlamaIndex integration | Less powerful than full GraphRAG |
+| **Hybrid (Vector + Graph)** | Vector search narrows candidates, graph traversal handles multi-hop | More complex to implement |
+
+### When to Use GraphRAG
+
+| Use it | Skip it |
+|---|---|
+| Documents describe relationships (org charts, research papers) | Simple fact retrieval — standard RAG is enough |
+| Queries need multi-hop reasoning ("who is connected to X?") | Small document sets (< 100 docs) |
+| Need global summarization across documents | Real-time indexing requirements |
+| | Cost-sensitive applications — indexing is expensive |
+
+*See [A17_graphRAGIntro.py](A17_graphRAGIntro.py) for a hand-built graph walkthrough (CEO → assistant → department → coworkers) plus an LLM-based entity extraction demo. Requires `networkx` — see the dependency note above.*
+
+---
+
+## Multimodal RAG with ColPali
+
+Standard RAG pipelines extract text from PDFs before chunking and embedding — but **text extraction is a lossy operation** for anything visual: tables, charts, diagrams, and layout all degrade or disappear entirely.
+
+### What Text Extraction Destroys
+
+A table like:
+
+```
+Region  | Q1 Target | Q1 Actual | Variance
+North   | $2.5M     | $2.8M     | +12% ✓
+South   | $1.8M     | $1.5M     | -17% ✗
+```
+
+commonly becomes, after extraction:
+
+```
+Q1 2025 Sales by Region Region Q1 Target Q1 Actual Variance
+North $2.5M $2.8M +12% South $1.8M $1.5M -17% East $3.2M $3.4M +6%
+```
+
+Row/column alignment, checkmarks/X's, and the visual "South is the outlier" signal are all gone — the LLM has to infer structure from a jumbled string.
+
+### The Solution: Vision-Based Document RAG (ColPali)
+
+Instead of extracting text, **convert each PDF page to an image and embed the image directly**:
+
+```
+PDF → Convert to images → Embed images (ColPali) → Store in Vector DB
+Query → Embed query (ColPali) → Find similar page images → Return page IMAGES
+                                                                  ↓
+                                                          Vision LLM (GPT-4o / Claude)
+                                                          "sees" the table/chart/diagram
+```
+
+ColPali (built on Google's PaliGemma) produces one embedding per page image that captures **both text and visual layout** — no OCR or text extraction step required. The retrieved page image is then sent to a vision-capable LLM (GPT-4o, Claude) that can directly answer questions about tables, charts, and diagrams.
+
+```python
+# Core pipeline shape (see file for full implementation)
+images = pdf_to_images(pdf_path)                       # pdf2image
+embeddings = embed_document_images(images)              # ColPali
+results = search_documents(query, embeddings, images)   # similarity search over image embeddings
+answer = answer_with_vision(query, results)              # GPT-4o/Claude vision call with page images
+```
+
+### Cost Trade-off
+
+| | Text RAG | Multimodal RAG (ColPali) |
+|---|---|---|
+| Embedding | ~$0.0001/page | ~$0.001/page (requires GPU) |
+| Query | ~$0.01/query (GPT-4o-mini) | ~$0.10/query (GPT-4o with images) |
+| **Overall** | Baseline | **~10x more expensive** — but preserves visual information |
+
+### When to Use It
+
+| Good fit | Not necessary |
+|---|---|
+| Financial reports (nested tables, charts, footnotes) | Plain text documents (novels, articles) |
+| Technical docs (architecture diagrams, flowcharts) | Simple structured/CSV-like data |
+| Scientific papers (figures, equations, graphs) | Documents where text extraction already works well |
+| Legal documents (formatted contracts, term tables) | Real-time applications (vision models are slower) |
+| Medical records (diagnostic images, lab tables) | Cost-sensitive applications |
+
+*See [A18_multiModelRAG.py](A18_multiModelRAG.py) for a runnable vision-LLM demo and the full ColPali pipeline reference implementation (embedding, search, and vision-based answering).*

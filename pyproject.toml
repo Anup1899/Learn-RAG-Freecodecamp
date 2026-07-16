@@ -21,5 +21,6 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "qdrant-client>=1.18.0",
     "rank-bm25>=0.2.2",
+    "tiktoken>=0.13.0",
     "voyageai>=0.3.7",
 ]
